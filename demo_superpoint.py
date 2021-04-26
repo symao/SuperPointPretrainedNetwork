@@ -121,6 +121,11 @@ class SuperPointNet(torch.nn.Module):
     desc = self.convDb(cDa)
     dn = torch.norm(desc, p=2, dim=1) # Compute the norm.
     desc = desc.div(torch.unsqueeze(dn, 1)) # Divide by norm to normalize.
+    semi = torch.nn.Softmax(dim=1)(semi)
+    # semi = torch.exp(semi) # Softmax.
+    # semi = semi / (torch.sum(semi, axis=1)+.00001) # Should sum to 1.
+    desc = desc.permute(0,2,3,1)
+    semi = semi.permute(0,2,3,1)
     return semi, desc
 
 
@@ -147,6 +152,30 @@ class SuperPointFrontend(object):
       self.net.load_state_dict(torch.load(weights_path,
                                map_location=lambda storage, loc: storage))
     self.net.eval()
+
+    if not self.cuda:
+      infer_w,infer_h = 180,320
+      output_model = os.path.splitext(weights_path)[0]+'_%dx%d.onnx'%(infer_w,infer_h)
+      dummy_input = torch.randn(1, 1, infer_h, infer_w, device='cpu')
+      torch.onnx.export(self.net, dummy_input, output_model, export_params=True,
+                          opset_version=11,                  # the ONNX version to export the model to
+                          do_constant_folding=True,          # whether to execute constant folding for optimization
+                          input_names = ['input'],           # the model's input names
+                          output_names = ['point','descriptor']         # the model's output names
+                          # dynamic_axes={'input' : {0 : 'batch_size'},       # variable lenght axes
+                          #              'output' : {0 : 'batch_size'}}
+                                      )
+      infer_w,infer_h = 360,640
+      output_model = os.path.splitext(weights_path)[0]+'_%dx%d.onnx'%(infer_w,infer_h)
+      dummy_input = torch.randn(1, 1, infer_h, infer_w, device='cpu')
+      torch.onnx.export(self.net, dummy_input, output_model, export_params=True,
+                          opset_version=11,                  # the ONNX version to export the model to
+                          do_constant_folding=True,          # whether to execute constant folding for optimization
+                          input_names = ['input'],           # the model's input names
+                          output_names = ['point','descriptor']         # the model's output names
+                          # dynamic_axes={'input' : {0 : 'batch_size'},       # variable lenght axes
+                          #              'output' : {0 : 'batch_size'}}
+                                      )
 
   def nms_fast(self, in_corners, H, W, dist_thresh):
     """
@@ -235,12 +264,10 @@ class SuperPointFrontend(object):
     outs = self.net.forward(inp)
     semi, coarse_desc = outs[0], outs[1]
     # Convert pytorch -> numpy.
-    semi = semi.data.cpu().numpy().squeeze()
-    # --- Process points.
-    dense = np.exp(semi) # Softmax.
-    dense = dense / (np.sum(dense, axis=0)+.00001) # Should sum to 1.
+    semi = semi.data.cpu().numpy().squeeze().transpose((2,0,1))
+    coarse_desc = coarse_desc.permute(0,3,1,2)
     # Remove dustbin.
-    nodust = dense[:-1, :, :]
+    nodust = semi[:-1, :, :]
     # Reshape to get full resolution heatmap.
     Hc = int(H / self.cell)
     Wc = int(W / self.cell)
@@ -278,7 +305,7 @@ class SuperPointFrontend(object):
       samp_pts = samp_pts.float()
       if self.cuda:
         samp_pts = samp_pts.cuda()
-      desc = torch.nn.functional.grid_sample(coarse_desc, samp_pts)
+      desc = torch.nn.functional.grid_sample(coarse_desc, samp_pts, align_corners=True)
       desc = desc.data.cpu().numpy().reshape(D, -1)
       desc /= np.linalg.norm(desc, axis=0)[np.newaxis, :]
     return pts, desc, heatmap
